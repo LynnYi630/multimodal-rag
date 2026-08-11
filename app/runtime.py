@@ -18,6 +18,7 @@ from app.infrastructure.providers import (
     DisabledVLMProvider,
     MockEmbeddingProvider,
     MockRerankerProvider,
+    OpenAICompatibleVLMProvider,
     PaddleOCRProvider,
     QwenLocalEmbeddingProvider,
     QwenLocalRerankerProvider,
@@ -79,11 +80,12 @@ def build_container(settings: Settings) -> Container:
         if settings.ocr_provider == "paddleocr"
         else DisabledOCRProvider()
     )
-    vlm = (
-        DashScopeVLMProvider(settings)
-        if settings.vlm_provider == "dashscope"
-        else DisabledVLMProvider()
-    )
+    if settings.vlm_provider == "dashscope":
+        vlm = DashScopeVLMProvider(settings)
+    elif settings.vlm_provider in {"vllm", "openai_compatible"}:
+        vlm = OpenAICompatibleVLMProvider(settings)
+    else:
+        vlm = DisabledVLMProvider()
     embedding = (
         QwenLocalEmbeddingProvider(settings)
         if settings.embedding_provider == "qwen_local"

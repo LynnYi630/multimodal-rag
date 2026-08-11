@@ -157,13 +157,27 @@ class DisabledVLMProvider:
         return ImageDescription(summary="")
 
 
-class DashScopeVLMProvider:
-    def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
-        self.base_url = settings.dashscope_base_url.rstrip("/")
-        self.api_key = settings.dashscope_api_key
-        self.model = settings.dashscope_vlm_model
+class _ChatCompletionsVLMProvider:
+    provider_name = "OpenAI-compatible VLM"
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout_seconds: float,
+        max_tokens: int | None = None,
+        extra_body: dict[str, Any] | None = None,
+        client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.max_tokens = max_tokens
+        self.extra_body = extra_body or {}
         self.client = client or httpx.AsyncClient(
-            timeout=httpx.Timeout(settings.vlm_timeout_seconds, connect=15)
+            timeout=httpx.Timeout(timeout_seconds, connect=15)
         )
         self._owns_client = client is None
 
@@ -188,35 +202,38 @@ class DashScopeVLMProvider:
             f"\n章节：{' / '.join(section_path[:10]) or '未知'}"
             f"\n已有标题：{(caption or '')[:300]}"
         )
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        body: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{encoded}",
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }
+            ],
+            "temperature": 0.1,
+            **self.extra_body,
+        }
+        if self.max_tokens is not None:
+            body["max_tokens"] = self.max_tokens
         response = await self.client.post(
             f"{self.base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:{media_type};base64,{encoded}",
-                                },
-                            },
-                            {"type": "text", "text": prompt},
-                        ],
-                    }
-                ],
-                "temperature": 0.1,
-                "enable_thinking": False,
-            },
+            headers=headers,
+            json=body,
         )
         if not response.is_success:
             raise ExternalProviderError(
-                f"DashScope VLM HTTP {response.status_code}: {response.text[:500]}"
+                f"{self.provider_name} HTTP {response.status_code}: {response.text[:500]}"
             )
         try:
             content = response.json()["choices"][0]["message"]["content"]
@@ -226,7 +243,9 @@ class DashScopeVLMProvider:
                 )
             parsed = _parse_json_object(content)
         except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ExternalProviderError("DashScope VLM returned invalid JSON") from exc
+            raise ExternalProviderError(
+                f"{self.provider_name} returned invalid JSON"
+            ) from exc
         return ImageDescription(
             summary=str(parsed.get("summary", ""))[:800],
             entities=_string_list(parsed.get("entities")),
@@ -235,6 +254,34 @@ class DashScopeVLMProvider:
             search_terms=_string_list(parsed.get("search_terms")),
             warnings=_string_list(parsed.get("warnings")),
             raw=response.json(),
+        )
+
+
+class DashScopeVLMProvider(_ChatCompletionsVLMProvider):
+    provider_name = "DashScope VLM"
+
+    def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
+        super().__init__(
+            base_url=settings.dashscope_base_url,
+            api_key=settings.dashscope_api_key,
+            model=settings.dashscope_vlm_model,
+            timeout_seconds=settings.vlm_timeout_seconds,
+            extra_body={"enable_thinking": False},
+            client=client,
+        )
+
+
+class OpenAICompatibleVLMProvider(_ChatCompletionsVLMProvider):
+    """VLM served by vLLM or another OpenAI-compatible Chat Completions API."""
+
+    def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
+        super().__init__(
+            base_url=settings.vlm_base_url,
+            api_key=settings.vlm_api_key,
+            model=settings.vlm_model,
+            timeout_seconds=settings.vlm_timeout_seconds,
+            max_tokens=settings.vlm_max_tokens,
+            client=client,
         )
 
 

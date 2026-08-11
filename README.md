@@ -164,24 +164,73 @@ QWEN_RERANKER_REPOSITORY_PATH=C:/Models/Qwen/Qwen3-VL-Reranker-2B/scripts
 
 本地 Embedding 和 Reranker 不需要 API Key。模型采用延迟加载并在首次调用后常驻进程；生产环境应使用 GPU，并根据显存规划 API/Worker 的进程数，避免每个进程重复加载一份模型。
 
-## OCR 和 VLM API Key
+## OCR 和 VLM
 
-当前尚未填写外部 API Key，因此两项 Provider 均保持禁用：
+OCR 与图片描述 VLM 是彼此独立的增强能力。未配置时可以保持禁用：
 
 ```env
 OCR_PROVIDER=disabled
 PADDLEOCR_ACCESS_TOKEN=
 
 VLM_PROVIDER=disabled
-DASHSCOPE_API_KEY=
-DASHSCOPE_VLM_MODEL=qwen3.7-flash
 ```
 
-准备好 Key 后：
+启用 PaddleOCR 云 API 或阿里云百炼 VLM 时：
 
 1. 填写 `PADDLEOCR_ACCESS_TOKEN`，并将 `OCR_PROVIDER` 改为 `paddleocr`。
 2. 填写 `DASHSCOPE_API_KEY`，并将 `VLM_PROVIDER` 改为 `dashscope`。
 3. 重启 FastAPI；若使用 Celery，也要重启 Worker。
+
+项目也支持通过 OpenAI-compatible Chat Completions API 调用本地 VLM。
+`VLM_PROVIDER=vllm` 与 `VLM_PROVIDER=openai_compatible` 使用同一套配置，前者用于明确标识部署方式。
+
+### 在服务器上部署 Qwen3-VL vLLM 服务
+
+建议让 vLLM 使用独立 Python 环境和独立进程，不要安装到本项目虚拟环境中。在服务器终端执行：
+
+```bash
+python3 -m venv ~/venvs/qwen-vllm
+source ~/venvs/qwen-vllm/bin/activate
+python -m pip install --upgrade pip
+pip install accelerate
+pip install "qwen-vl-utils==0.0.14"
+pip install --upgrade "vllm>=0.11.0"
+
+CUDA_VISIBLE_DEVICES=0 vllm serve \
+  /home/wangyi/models/Qwen/Qwen3-VL-8B-Instruct-FP8 \
+  --host 127.0.0.1 \
+  --port 8100 \
+  --served-model-name qwen3-vl-8b-instruct-fp8 \
+  --api-key local-vlm-key \
+  --max-model-len 8192 \
+  --max-num-seqs 2 \
+  --gpu-memory-utilization 0.50 \
+  --limit-mm-per-prompt '{"image":1}'
+```
+
+RTX 5090 同时运行 VLM、Embedding 和 Reranker 时，先从 `0.50` 的 vLLM 显存比例和单个 Celery Worker 开始；确认显存余量后再逐步提高并发。若这三个模型分配到不同 GPU，可以分别提高各服务的显存预算。
+
+另开一个服务器终端验证 vLLM：
+
+```bash
+curl -sS http://127.0.0.1:8100/v1/models \
+  -H "Authorization: Bearer local-vlm-key"
+```
+
+然后在项目服务器的 `.env` 中配置：
+
+```env
+VLM_PROVIDER=vllm
+VLM_BASE_URL=http://127.0.0.1:8100/v1
+VLM_API_KEY=local-vlm-key
+VLM_MODEL=qwen3-vl-8b-instruct-fp8
+VLM_MAX_TOKENS=800
+VLM_TIMEOUT_SECONDS=120
+```
+
+`VLM_MODEL` 必须与 `--served-model-name` 一致。若 vLLM 未使用 `--api-key`，`VLM_API_KEY` 可留空；若 FastAPI 或 Celery 在 Docker 容器内运行，则 `127.0.0.1` 要改为容器能够访问的 vLLM 地址。
+
+VLM 在文档入库阶段处理解析出的图片，描述结果会写入派生对象并参与 Embedding。修改 VLM 配置后必须同时重启 FastAPI 和 Celery Worker；已经入库的文档不会自动补充描述，需要使用 `force=true` 创建新版本并重新入库。
 
 ## 启动 API
 

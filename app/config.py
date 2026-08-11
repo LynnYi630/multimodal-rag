@@ -74,10 +74,16 @@ class Settings(BaseSettings):
     paddleocr_poll_interval_seconds: float = 5
     paddleocr_timeout_seconds: float = 600
 
-    vlm_provider: Literal["disabled", "dashscope"] = "disabled"
+    vlm_provider: Literal[
+        "disabled", "dashscope", "vllm", "openai_compatible"
+    ] = "disabled"
     dashscope_api_key: str = ""
     dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     dashscope_vlm_model: str = "qwen3.7-flash"
+    vlm_base_url: str = "http://127.0.0.1:8100/v1"
+    vlm_api_key: str = ""
+    vlm_model: str = "qwen3-vl-8b-instruct-fp8"
+    vlm_max_tokens: int = 800
     vlm_timeout_seconds: float = 120
 
     max_upload_bytes: int = 100 * 1024 * 1024
@@ -100,6 +106,17 @@ class Settings(BaseSettings):
             raise ValueError("PADDLEOCR_ACCESS_TOKEN is required when OCR_PROVIDER=paddleocr")
         if self.vlm_provider == "dashscope" and not self.dashscope_api_key:
             raise ValueError("DASHSCOPE_API_KEY is required when VLM_PROVIDER=dashscope")
+        if self.vlm_provider in {"vllm", "openai_compatible"}:
+            if not self.vlm_base_url.strip():
+                raise ValueError(
+                    "VLM_BASE_URL is required when VLM_PROVIDER=vllm/openai_compatible"
+                )
+            if not self.vlm_model.strip():
+                raise ValueError(
+                    "VLM_MODEL is required when VLM_PROVIDER=vllm/openai_compatible"
+                )
+            if self.vlm_max_tokens <= 0:
+                raise ValueError("VLM_MAX_TOKENS must be greater than zero")
         if self.storage_provider == "minio" and (
             not self.minio_access_key or not self.minio_secret_key
         ):
