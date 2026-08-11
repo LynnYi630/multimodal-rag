@@ -51,15 +51,27 @@ class DoclingAdapter:
     def __init__(
         self,
         artifacts_path: Path | None = None,
+        *,
+        ocr_engine: str = "rapidocr",
+        rapidocr_backend: str = "torch",
+        ocr_languages: list[str] | None = None,
     ) -> None:
         self.artifacts_path = artifacts_path
+        self.ocr_engine = ocr_engine
+        self.rapidocr_backend = rapidocr_backend
+        self.ocr_languages = ocr_languages or ["chinese"]
 
     @property
     def version(self) -> str:
         try:
-            return version("docling")
+            docling_version = version("docling")
         except PackageNotFoundError:
             return "not-installed"
+        ocr_version = self.ocr_engine
+        if self.ocr_engine == "rapidocr":
+            ocr_version = f"{ocr_version}-{self.rapidocr_backend}"
+        languages = "-".join(self.ocr_languages)
+        return f"{docling_version}+ocr-{ocr_version}-{languages}"
 
     def supports(self, media_type: str, filename: str) -> bool:
         return filename.lower().endswith((".pdf", ".docx", ".pptx"))
@@ -74,10 +86,6 @@ class DoclingAdapter:
     ) -> UnifiedDocument:
         try:
             from docling.datamodel.base_models import DocumentStream, InputFormat
-            from docling.datamodel.pipeline_options import (
-                PdfPipelineOptions,
-                TableStructureV2Options,
-            )
             from docling.document_converter import DocumentConverter, PdfFormatOption
             from docling_core.types.doc import PictureItem, TableItem, TextItem
         except ImportError as exc:
@@ -85,13 +93,7 @@ class DoclingAdapter:
                 "Docling is not installed; run `pip install -e .[docling]`"
             ) from exc
 
-        options = PdfPipelineOptions()
-        options.artifacts_path = self.artifacts_path
-        options.do_ocr = True
-        options.do_table_structure = True
-        options.table_structure_options = TableStructureV2Options()
-        options.generate_picture_images = True
-        options.generate_page_images = True
+        options = self._pdf_pipeline_options()
         converter = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(pipeline_options=options),
@@ -183,6 +185,30 @@ class DoclingAdapter:
         except AttributeError:
             raw = {"markdown": document.export_to_markdown()}
         return UnifiedDocument(blocks=blocks, images=images, raw=raw)
+
+    def _pdf_pipeline_options(self) -> Any:
+        from docling.datamodel.pipeline_options import (
+            OcrAutoOptions,
+            PdfPipelineOptions,
+            RapidOcrOptions,
+            TableStructureV2Options,
+        )
+
+        options = PdfPipelineOptions()
+        options.artifacts_path = self.artifacts_path
+        options.do_ocr = True
+        if self.ocr_engine == "rapidocr":
+            options.ocr_options = RapidOcrOptions(
+                lang=self.ocr_languages,
+                backend=self.rapidocr_backend,
+            )
+        else:
+            options.ocr_options = OcrAutoOptions(lang=self.ocr_languages)
+        options.do_table_structure = True
+        options.table_structure_options = TableStructureV2Options()
+        options.generate_picture_images = True
+        options.generate_page_images = True
+        return options
 
 
 class MinerUAdapter:

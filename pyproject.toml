@@ -30,7 +30,10 @@ dev = [
   "pytest-asyncio>=1.1,<2",
   "ruff>=0.12,<1",
 ]
-docling = ["docling>=2.66,<3"]
+docling = [
+  "docling[rapidocr]>=2.66,<3",
+  "torch==2.8.0",
+]
   qwen-local = [
     "qwen-vl-utils>=0.0.14,<1",
     "safetensors>=0.6,<1",

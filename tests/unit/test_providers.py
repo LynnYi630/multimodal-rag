@@ -6,6 +6,8 @@ import pytest
 from app.config import Settings
 from app.domain.models import MultimodalInput
 from app.infrastructure.providers import (
+    DashScopeEmbeddingProvider,
+    DashScopeRerankerProvider,
     DashScopeVLMProvider,
     MockEmbeddingProvider,
     OpenAICompatibleVLMProvider,
@@ -259,3 +261,95 @@ async def test_vllm_reranker_uses_multimodal_rerank_api() -> None:
     await client.aclose()
 
     assert [(item.index, item.score) for item in result] == [(1, 0.91), (0, 0.12)]
+
+
+@pytest.mark.asyncio
+async def test_dashscope_embedding_requests_one_fused_vector() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://dashscope.local/multimodal-embedding"
+        assert request.headers["Authorization"] == "Bearer dashscope-key"
+        body = json.loads(request.content)
+        assert body["model"] == "qwen3-vl-embedding"
+        assert body["input"]["contents"][0] == {
+            "text": "document instruction\n图片说明"
+        }
+        image = body["input"]["contents"][1]["image"]
+        assert image.startswith("data:image/png;base64,")
+        assert body["parameters"] == {"enable_fusion": True, "dimension": 3}
+        return httpx.Response(
+            200,
+            json={
+                "output": {
+                    "embeddings": [
+                        {"index": 0, "embedding": [0.0, 4.0, 0.0], "type": "fused"}
+                    ]
+                }
+            },
+        )
+
+    settings = Settings(
+        _env_file=None,
+        embedding_provider="dashscope",
+        embedding_dimension=3,
+        dashscope_api_key="dashscope-key",
+        dashscope_embedding_url="https://dashscope.local/multimodal-embedding",
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = DashScopeEmbeddingProvider(settings, client)
+    result = await provider.embed_query(
+        MultimodalInput(
+            text="图片说明",
+            image=b"\x89PNG\r\n",
+            instruction="document instruction",
+        )
+    )
+    await client.aclose()
+
+    assert result == [0.0, 1.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_dashscope_reranker_uses_native_nested_protocol() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://dashscope.local/text-rerank"
+        assert request.headers["Authorization"] == "Bearer dashscope-key"
+        body = json.loads(request.content)
+        assert body["model"] == "qwen3-vl-rerank"
+        assert body["input"]["query"] == {"text": "人民建议"}
+        assert body["input"]["documents"][0] == {"text": "无关内容"}
+        image = body["input"]["documents"][1]["image"]
+        assert image.startswith("data:image/png;base64,")
+        assert body["parameters"]["return_documents"] is False
+        assert body["parameters"]["top_n"] == 2
+        assert body["parameters"]["instruct"].startswith("Retrieve text passages")
+        return httpx.Response(
+            200,
+            json={
+                "output": {
+                    "results": [
+                        {"index": 1, "relevance_score": 0.88},
+                        {"index": 0, "relevance_score": 0.21},
+                    ]
+                }
+            },
+        )
+
+    settings = Settings(
+        _env_file=None,
+        reranker_provider="dashscope",
+        dashscope_api_key="dashscope-key",
+        dashscope_reranker_url="https://dashscope.local/text-rerank",
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = DashScopeRerankerProvider(settings, client)
+    result = await provider.rerank(
+        MultimodalInput(text="人民建议"),
+        [
+            MultimodalInput(text="无关内容"),
+            MultimodalInput(text="图片说明", image=b"\x89PNG\r\n"),
+        ],
+        top_n=2,
+    )
+    await client.aclose()
+
+    assert [(item.index, item.score) for item in result] == [(1, 0.88), (0, 0.21)]

@@ -340,6 +340,156 @@ class MockRerankerProvider:
         return sorted(scores, key=lambda item: (-item.score, item.index))[:top_n]
 
 
+class DashScopeEmbeddingProvider:
+    """Qwen3-VL embedding through the native DashScope multimodal API."""
+
+    def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
+        self.model_name = settings.embedding_model
+        self.revision = settings.embedding_revision
+        self.dimension = settings.embedding_dimension
+        self.url = settings.dashscope_embedding_url
+        self.api_key = settings.dashscope_api_key
+        self.served_model = settings.dashscope_embedding_model
+        self._semaphore = asyncio.Semaphore(settings.dashscope_embedding_concurrency)
+        self.client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                settings.dashscope_embedding_timeout_seconds,
+                connect=15,
+            )
+        )
+        self._owns_client = client is None
+
+    async def close(self) -> None:
+        if self._owns_client:
+            await self.client.aclose()
+
+    async def embed_query(self, query: MultimodalInput) -> list[float]:
+        return await self._embed_one(query)
+
+    async def embed_documents(
+        self,
+        documents: list[MultimodalInput],
+    ) -> list[list[float]]:
+        return list(await asyncio.gather(*(self._embed_one(item) for item in documents)))
+
+    async def _embed_one(self, value: MultimodalInput) -> list[float]:
+        contents: list[dict[str, str]] = []
+        text = "\n".join(filter(None, [value.instruction, value.text]))
+        if text:
+            contents.append({"text": text})
+        if value.image:
+            contents.append({"image": _image_data_uri(value.image)})
+        if not contents:
+            contents.append({"text": ""})
+        async with self._semaphore:
+            response = await self.client.post(
+                self.url,
+                headers=_bearer_headers(self.api_key),
+                json={
+                    "model": self.served_model,
+                    "input": {"contents": contents},
+                    "parameters": {
+                        "enable_fusion": True,
+                        "dimension": self.dimension,
+                    },
+                },
+            )
+        if not response.is_success:
+            raise ExternalProviderError(
+                f"DashScope embedding HTTP {response.status_code}: {response.text[:500]}"
+            )
+        try:
+            embeddings = response.json()["output"]["embeddings"]
+            if len(embeddings) != 1:
+                raise ValueError("expected one fused embedding")
+            vector = list(map(float, embeddings[0]["embedding"]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ExternalProviderError(
+                "DashScope embedding returned invalid JSON"
+            ) from exc
+        if len(vector) != self.dimension:
+            raise ExternalProviderError(
+                f"DashScope embedding output must be {self.dimension} dimensions"
+            )
+        return normalize(vector)
+
+
+class DashScopeRerankerProvider:
+    """Qwen3-VL reranker through the native DashScope rerank API."""
+
+    def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
+        self.model_name = settings.reranker_model
+        self.revision = settings.reranker_revision
+        self.url = settings.dashscope_reranker_url
+        self.api_key = settings.dashscope_api_key
+        self.served_model = settings.dashscope_reranker_model
+        self.instruction = settings.dashscope_reranker_instruction
+        self.client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                settings.dashscope_reranker_timeout_seconds,
+                connect=15,
+            )
+        )
+        self._owns_client = client is None
+
+    async def close(self) -> None:
+        if self._owns_client:
+            await self.client.aclose()
+
+    async def rerank(
+        self,
+        query: MultimodalInput,
+        candidates: list[MultimodalInput],
+        *,
+        top_n: int,
+    ) -> list[RerankScore]:
+        if not candidates or top_n <= 0:
+            return []
+        requested_top_n = min(top_n, len(candidates))
+        response = await self.client.post(
+            self.url,
+            headers=_bearer_headers(self.api_key),
+            json={
+                "model": self.served_model,
+                "input": {
+                    "query": _dashscope_rerank_input(query),
+                    "documents": [
+                        _dashscope_rerank_input(item) for item in candidates
+                    ],
+                },
+                "parameters": {
+                    "return_documents": False,
+                    "top_n": requested_top_n,
+                    "instruct": self.instruction,
+                },
+            },
+        )
+        if not response.is_success:
+            raise ExternalProviderError(
+                f"DashScope reranker HTTP {response.status_code}: {response.text[:500]}"
+            )
+        try:
+            values = response.json()["output"]["results"]
+            scores = [
+                RerankScore(
+                    index=int(item["index"]),
+                    score=float(item["relevance_score"]),
+                )
+                for item in values
+            ]
+            if len(scores) != requested_top_n:
+                raise ValueError("reranker result count mismatch")
+            if len({item.index for item in scores}) != len(scores):
+                raise ValueError("reranker returned duplicate indexes")
+            if any(item.index < 0 or item.index >= len(candidates) for item in scores):
+                raise ValueError("reranker index out of range")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ExternalProviderError(
+                "DashScope reranker returned invalid JSON"
+            ) from exc
+        return sorted(scores, key=lambda item: (-item.score, item.index))
+
+
 class VLLMEmbeddingProvider:
     """Qwen3-VL embedding served by vLLM's multimodal Embeddings API."""
 
@@ -482,9 +632,7 @@ class QwenLocalEmbeddingProvider:
         self.module_name = settings.qwen_embedding_module
         self.class_name = settings.qwen_embedding_class
         self.model_path = settings.qwen_embedding_model_path
-        self.repository_path = (
-            settings.qwen_embedding_repository_path or settings.qwen_repository_path
-        )
+        self.repository_path = settings.qwen_embedding_repository_path
         self._model: Any = None
         self._lock = asyncio.Lock()
 
@@ -530,9 +678,7 @@ class QwenLocalRerankerProvider:
         self.module_name = settings.qwen_reranker_module
         self.class_name = settings.qwen_reranker_class
         self.model_path = settings.qwen_reranker_model_path
-        self.repository_path = (
-            settings.qwen_reranker_repository_path or settings.qwen_repository_path
-        )
+        self.repository_path = settings.qwen_reranker_repository_path
         self._model: Any = None
         self._lock = asyncio.Lock()
 
@@ -645,12 +791,25 @@ def _vllm_content(value: MultimodalInput) -> list[dict[str, Any]]:
 
 
 def _vllm_image_part(image: bytes) -> dict[str, Any]:
-    media_type = _detect_image_media_type(image)
-    encoded = base64.b64encode(image).decode("ascii")
     return {
         "type": "image_url",
-        "image_url": {"url": f"data:{media_type};base64,{encoded}"},
+        "image_url": {"url": _image_data_uri(image)},
     }
+
+
+def _dashscope_rerank_input(value: MultimodalInput) -> str | dict[str, str]:
+    # DashScope documents accept one modality per candidate. Prefer the original
+    # image for image nodes; text nodes retain their complete section content.
+    if value.image:
+        return {"image": _image_data_uri(value.image)}
+    text = "\n".join(filter(None, [value.instruction, value.text]))
+    return {"text": text}
+
+
+def _image_data_uri(image: bytes) -> str:
+    media_type = _detect_image_media_type(image)
+    encoded = base64.b64encode(image).decode("ascii")
+    return f"data:{media_type};base64,{encoded}"
 
 
 def _semantic_tokens(text: str) -> list[str]:

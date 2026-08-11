@@ -13,6 +13,8 @@ from app.config import Settings
 from app.infrastructure.database import Database
 from app.infrastructure.parsers import DoclingAdapter, PlainTextParser
 from app.infrastructure.providers import (
+    DashScopeEmbeddingProvider,
+    DashScopeRerankerProvider,
     DashScopeVLMProvider,
     DisabledOCRProvider,
     DisabledVLMProvider,
@@ -81,7 +83,16 @@ def build_container(settings: Settings) -> Container:
     parser = (
         PlainTextParser()
         if settings.parser_provider == "plain_text"
-        else DoclingAdapter(settings.docling_artifacts_path)
+        else DoclingAdapter(
+            settings.docling_artifacts_path,
+            ocr_engine=settings.docling_ocr_engine,
+            rapidocr_backend=settings.docling_rapidocr_backend,
+            ocr_languages=[
+                language.strip()
+                for language in settings.docling_ocr_languages.split(",")
+                if language.strip()
+            ],
+        )
     )
     ocr = (
         PaddleOCRProvider(settings)
@@ -98,12 +109,16 @@ def build_container(settings: Settings) -> Container:
         embedding = QwenLocalEmbeddingProvider(settings)
     elif settings.embedding_provider == "vllm":
         embedding = VLLMEmbeddingProvider(settings)
+    elif settings.embedding_provider == "dashscope":
+        embedding = DashScopeEmbeddingProvider(settings)
     else:
         embedding = MockEmbeddingProvider(settings.embedding_dimension)
     if settings.reranker_provider == "qwen_local":
         reranker = QwenLocalRerankerProvider(settings)
     elif settings.reranker_provider == "vllm":
         reranker = VLLMRerankerProvider(settings)
+    elif settings.reranker_provider == "dashscope":
+        reranker = DashScopeRerankerProvider(settings)
     else:
         reranker = MockRerankerProvider()
     documents = DocumentService(

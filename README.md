@@ -1,389 +1,389 @@
 # FastAPI 多模态 RAG 检索服务
 
-这是 `FastAPI多模态RAG服务实现方案.md` 的第一版可运行实现。服务负责文档导入和多模态检索，不生成最终答案：文本与图片分别召回，经 RRF 融合，再由统一 Reranker 重排后返回。
+该服务提供面向 PDF、DOCX、PPTX 等文档的多模态入库与检索能力。文本与图片分别召回，经 RRF 融合和统一 Reranker 重排后返回；服务本身不生成最终问答内容。
 
-## 当前本机配置
+## 核心能力
 
-项目当前使用真实基础设施和本地 Qwen 模型，不再以 SQLite、内存向量库或 Mock 模型作为 `.env` 默认值。
+- FastAPI 文档上传、版本管理、任务查询、资源访问和检索接口
+- PostgreSQL 保存文档、版本、节点、ACL 和任务状态
+- MinIO 保存原始文件、抽取图片和派生结果
+- Celery + Redis 异步执行文档入库
+- Docling 解析 PDF、DOCX、PPTX
+- RapidOCR 处理扫描页基础 OCR
+- PaddleOCR-VL 和视觉语言模型进行图片增强理解
+- Qwen3-VL Embedding 生成统一文本/图片向量
+- Qdrant 执行文本节点和图片节点向量召回
+- RRF 融合与 Qwen3-VL Reranker 统一重排
+- Tenant、User、Role、Group 维度的检索权限过滤
+- Mock Provider 支持无外部模型依赖的自动化测试
 
-| 组件 | 当前配置 |
-| --- | --- |
-| PostgreSQL | 容器 `postgres`，镜像 `postgres:17`，数据库 `appdb`，用户 `postgres`，端口 `5432` |
-| Redis | 容器 `redis`，镜像 `redis:7.4`，端口 `6379`，密码 `123456` |
-| Qdrant | 容器 `qdrant`，镜像 `qdrant/qdrant:v1.18.3`，HTTP 端口 `6333` |
-| MinIO | 容器 `minio`，镜像 `minio/minio:RELEASE.2025-04-22T22-12-26Z`，API 端口 `9000`，控制台端口 `9001` |
-| Embedding | `C:/Models/Qwen/Qwen3-VL-Embedding-2B`，向量维度 `2048` |
-| Reranker | `C:/Models/Qwen/Qwen3-VL-Reranker-2B` |
+## 数据流
 
-MinIO 应用账号为 `rag-service`，密码为 `service123`，使用以下三个私有 Bucket：
+```text
+上传文档
+  -> MinIO 保存原文件
+  -> PostgreSQL 创建文档版本和入库任务
+  -> Celery Worker
+  -> Docling + RapidOCR 解析版面、正文、表格和图片
+  -> PaddleOCR / VLM 增强图片信息
+  -> Embedding 生成节点向量
+  -> Qdrant 写入向量和 ACL Payload
 
-- `rag-originals`：保存上传的原始文件
-- `rag-assets`：保存文档解析出的图片等资源
-- `rag-derived`：保存解析、OCR、描述等派生结果
-
-`.env` 保存本机密码和 API Key，已加入 `.gitignore`，不应提交到版本库。`.env.example` 是带详细说明的配置模板。
+搜索请求
+  -> Query Embedding
+  -> 文本节点召回 + 图片节点召回
+  -> RRF 融合
+  -> ACL 与版本过滤
+  -> Reranker 重排
+  -> 返回文本片段或图片元数据
+```
 
 ## 环境要求
 
 - Python 3.11–3.13
-- Docker Desktop
-- 已下载上述两个 Qwen 模型
-- CPU 可以运行真实模型，但首次加载和推理较慢，并且需要较多内存；当前本机没有 NVIDIA GPU
+- PostgreSQL 17 或兼容版本
+- Redis 7 或兼容版本
+- Qdrant
+- MinIO
+- Docling 模型文件
+- 根据所选 Provider 准备 DashScope API Key、PaddleOCR Access Token 或本地模型服务
 
-创建虚拟环境并一次性安装核心依赖及全部可选依赖：
+## 安装
 
-```powershell
-cd C:\Development\multimodal-rag
+创建虚拟环境后安装开发和文档解析依赖：
+
+```bash
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -e ".[dev,docling,qwen-local]"
+pip install -e ".[dev,docling]"
 ```
 
-三个可选依赖组分别是：
-
-- `dev`：pytest、ruff 等开发和测试工具
-- `docling`：文档解析组件
-- `qwen-local`：PyTorch、Transformers、Qwen VL 工具和本地模型运行依赖
-
-## 启动基础设施
-
-现有容器全部启动：
+PowerShell 激活命令：
 
 ```powershell
-docker start postgres redis qdrant minio
-docker ps
+.\.venv\Scripts\Activate.ps1
 ```
 
-当前 `CELERY_TASK_ALWAYS_EAGER=true`，所以 Redis 在同步开发模式下不是必需的；这里仍启动 Redis，便于随后切换到真正的异步 Worker。
+可选依赖组：
 
-验证 PostgreSQL：
+- `dev`：pytest、pytest-asyncio、ruff
+- `docling`：Docling、RapidOCR 和 Torch 文档解析组件
+- `qwen-local`：进程内加载 Qwen Embedding/Reranker 时需要
 
-```powershell
-docker exec postgres pg_isready -U postgres -d appdb
-docker exec postgres psql -U postgres -d appdb -c "SELECT current_database(), current_user;"
+## 配置
+
+复制配置模板并填写真实连接信息和凭证：
+
+```bash
+cp .env.example .env
 ```
 
-验证 Redis：
+`.env` 包含密码和 API Key，已被 Git 忽略，不应提交到版本库。完整字段说明见 `.env.example`。
 
-```powershell
-docker exec redis redis-cli -a 123456 ping
+生产或共享环境至少需要确认以下配置：
+
+```env
+DATABASE_URL=postgresql+asyncpg://<user>:<password>@<postgres-host>:5432/<database>
+REDIS_URL=redis://:<password>@<redis-host>:6379/0
+
+VECTOR_PROVIDER=qdrant
+QDRANT_URL=http://<qdrant-host>:6333
+QDRANT_COLLECTION=knowledge_nodes_dashscope_2048
+
+STORAGE_PROVIDER=minio
+MINIO_ENDPOINT=<minio-host>:9000
+MINIO_ACCESS_KEY=<application-access-key>
+MINIO_SECRET_KEY=<application-secret-key>
+MINIO_SECURE=false
+
+CELERY_TASK_ALWAYS_EAGER=false
 ```
 
-验证 Qdrant：
+MinIO 使用三个私有 Bucket：
 
-```powershell
-curl.exe http://127.0.0.1:6333/collections
-```
+- `rag-originals`：上传的原始文件
+- `rag-assets`：解析出的图片和页面渲染图
+- `rag-derived`：Docling、OCR、VLM 等派生结果
 
-MinIO 控制台地址为 `http://127.0.0.1:9001`。管理员账号仅用于管理：
+应用账号应只获得上述 Bucket 所需的最小权限，不应使用 MinIO 管理员凭证。
 
-```text
-用户名：admin
-密码：admin123
-```
+## 数据库与 Qdrant 初始化
 
-应用自身使用 `.env` 中的 `rag-service/service123`，不要在应用里使用管理员账号。
+首次部署或升级版本时执行数据库迁移：
 
-## 初始化数据库和 Qdrant
-
-PostgreSQL 容器通过以下初始化参数创建了数据库，因此不需要再次手动执行 `CREATE DATABASE`：
-
-```text
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=123456
-POSTGRES_DB=appdb
-```
-
-首次使用或迁移版本发生变化时执行：
-
-```powershell
+```bash
 python -m alembic upgrade head
 ```
 
-当前数据库迁移版本为 `0002`。该版本将 `documents.source_type` 扩展为
-`VARCHAR(128)`，以容纳 DOCX、PPTX 等 Office 文件的标准 MIME 类型。`.env` 中设置了：
+当 `AUTO_CREATE_SCHEMA=false` 时，应用不会代替 Alembic 创建业务表。
+
+Qdrant Collection 由应用启动时检查并创建。Collection 的向量维度必须与 Embedding Provider 一致：
 
 ```env
-DATABASE_URL=postgresql+asyncpg://postgres:123456@127.0.0.1:5432/appdb
-AUTO_CREATE_SCHEMA=false
-```
-
-Qdrant Collection 不需要提前手动创建。应用启动时会检查并自动创建：
-
-```env
-VECTOR_PROVIDER=qdrant
-QDRANT_URL=http://localhost:6333
-QDRANT_COLLECTION=knowledge_nodes
+QDRANT_COLLECTION=knowledge_nodes_dashscope_2048
 EMBEDDING_DIMENSION=2048
 ```
 
-`knowledge_nodes` 使用 2048 维向量和 Cosine 距离，并自动创建检索所需的 Payload 索引。Collection 创建后不能直接修改向量维度；更换为不同维度的 Embedding 模型时，应新建或重建 Collection。
+不同模型或不同语义空间产生的向量不应写入同一个 Collection。更换 Embedding 模型、维度或语义空间时，应创建新的 Collection 并重新入库。
 
-## Docling PDF 模型
+## Docling 与 RapidOCR
 
-扫描版 PDF 需要提前准备 Docling 的布局、表格和 OCR 模型。Windows 推荐显式下载到不依赖符号链接的本地目录：
+扫描版 PDF 需要布局、TableFormer V2 和 RapidOCR 模型：
 
-```powershell
-& ".\.venv\Scripts\python.exe" -m docling.cli.tools models download `
-  layout tableformer rapidocr `
-  --output-dir "C:\Models\Docling"
+```bash
+python -m docling.cli.tools models download \
+  layout tableformerv2 rapidocr \
+  --output-dir "${DOCLING_MODEL_DIR}"
 ```
 
-然后在 `.env` 中把模型根目录交给应用：
+配置模型根目录和 OCR 引擎：
 
 ```env
 PARSER_PROVIDER=docling
-DOCLING_ARTIFACTS_PATH=C:/Models/Docling
+DOCLING_ARTIFACTS_PATH=/models/docling
+DOCLING_OCR_ENGINE=rapidocr
+DOCLING_RAPIDOCR_BACKEND=torch
+DOCLING_OCR_LANGUAGES=chinese
 ```
 
-该目录至少应包含 `docling-project--docling-layout-heron`、`docling-project--docling-models` 和 `RapidOcr`。配置的是三者共同的父目录，不是某个模型子目录。显式路径可以避免首次解析 PDF 时访问 Hugging Face 全局缓存，也规避普通 Windows 账户无法创建缓存符号链接的问题。
+模型根目录至少应包含：
 
-## 本地 Qwen 模型
+- `docling-project--docling-layout-heron`
+- `docling-project--TableFormerV2`
+- `RapidOcr`
 
-当前配置分别加载两个模型快照自带的 Python 脚本：
+`torch` 后端可使用兼容的 CUDA PyTorch；CPU 部署可选择 `onnxruntime`。应用显式选择 RapidOCR，避免 Docling 自动探测因运行环境不同而切换 OCR 引擎。
+
+Docling 内部 RapidOCR 与 `OCR_PROVIDER=paddleocr` 作用不同：RapidOCR 负责文档基础解析，PaddleOCR-VL 负责对抽取图片或扫描页进行增强识别，两者可以同时启用。
+
+## Provider 配置
+
+### DashScope 云端模式
+
+```env
+EMBEDDING_PROVIDER=dashscope
+EMBEDDING_DIMENSION=2048
+DASHSCOPE_EMBEDDING_URL=https://dashscope.aliyuncs.com/api/v1/services/embeddings/multimodal-embedding/multimodal-embedding
+DASHSCOPE_EMBEDDING_MODEL=qwen3-vl-embedding
+DASHSCOPE_EMBEDDING_CONCURRENCY=4
+
+RERANKER_PROVIDER=dashscope
+DASHSCOPE_RERANKER_URL=https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+DASHSCOPE_RERANKER_MODEL=qwen3-vl-rerank
+
+VLM_PROVIDER=dashscope
+DASHSCOPE_VLM_MODEL=qwen3.7-flash
+DASHSCOPE_API_KEY=<dashscope-api-key>
+
+OCR_PROVIDER=paddleocr
+PADDLEOCR_MODEL=PaddleOCR-VL-1.6
+PADDLEOCR_ACCESS_TOKEN=<paddleocr-access-token>
+```
+
+Embedding Provider 对每个节点启用多模态融合并输出与 Qdrant 一致的向量维度。图片节点在 Reranker 阶段优先发送原始图片；OCR、图片描述和关联正文参与前一阶段的融合 Embedding。
+
+### 进程内 Qwen 模型
 
 ```env
 EMBEDDING_PROVIDER=qwen_local
 EMBEDDING_MODEL=Qwen/Qwen3-VL-Embedding-2B
-EMBEDDING_REVISION=local
-EMBEDDING_DIMENSION=2048
-QWEN_EMBEDDING_MODULE=qwen3_vl_embedding
-QWEN_EMBEDDING_CLASS=Qwen3VLEmbedder
-QWEN_EMBEDDING_MODEL_PATH=C:/Models/Qwen/Qwen3-VL-Embedding-2B
-QWEN_EMBEDDING_REPOSITORY_PATH=C:/Models/Qwen/Qwen3-VL-Embedding-2B/scripts
+EMBEDDING_REVISION=<model-revision>
+QWEN_EMBEDDING_MODEL_PATH=/models/Qwen3-VL-Embedding-2B
+QWEN_EMBEDDING_REPOSITORY_PATH=/models/Qwen3-VL-Embedding-2B/scripts
 
 RERANKER_PROVIDER=qwen_local
 RERANKER_MODEL=Qwen/Qwen3-VL-Reranker-2B
-RERANKER_REVISION=local
-QWEN_RERANKER_MODULE=qwen3_vl_reranker
-QWEN_RERANKER_CLASS=Qwen3VLReranker
-QWEN_RERANKER_MODEL_PATH=C:/Models/Qwen/Qwen3-VL-Reranker-2B
-QWEN_RERANKER_REPOSITORY_PATH=C:/Models/Qwen/Qwen3-VL-Reranker-2B/scripts
+RERANKER_REVISION=<model-revision>
+QWEN_RERANKER_MODEL_PATH=/models/Qwen3-VL-Reranker-2B
+QWEN_RERANKER_REPOSITORY_PATH=/models/Qwen3-VL-Reranker-2B/scripts
 ```
 
-本地 Embedding 和 Reranker 不需要 API Key。模型采用延迟加载并在首次调用后常驻进程；生产环境应使用 GPU，并根据显存规划 API/Worker 的进程数，避免每个进程重复加载一份模型。
+进程内模型采用延迟加载，并在首次调用后常驻进程。多个 API 或 Worker 进程可能分别加载一份模型，需要按内存和显存容量规划进程数。
 
-### 使用 vLLM 部署 Embedding 和 Reranker
+### vLLM Embedding 与 Reranker
 
-Qwen3-VL-Embedding/Reranker 的 vLLM 支持要求 `vllm>=0.14.0`。两个模型必须分别启动为独立 pooling 服务；不能与生成式 VLM 共用同一个 vLLM 进程。
+Qwen3-VL Embedding 和 Reranker 分别启动独立 pooling 服务。示例中的路径、端口和并发需要按部署环境调整。
 
-Embedding 服务：
+Embedding：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 vllm serve \
-  /home/wangyi/models/Qwen/Qwen3-VL-Embedding-2B \
+vllm serve /models/Qwen3-VL-Embedding-2B \
   --runner pooling \
-  --host 127.0.0.1 \
+  --host 0.0.0.0 \
   --port 8200 \
   --served-model-name qwen3-vl-embedding-2b \
-  --api-key local-embedding-key \
+  --api-key <embedding-api-key> \
   --max-model-len 8192 \
-  --max-num-seqs 8 \
-  --gpu-memory-utilization 0.22 \
   --limit-mm-per-prompt '{"image":1}'
 ```
 
-Reranker 必须使用 vLLM 官方 Qwen3-VL 模板。先下载模板：
+Reranker：
 
 ```bash
-mkdir -p ~/models/Qwen/vllm-templates
-curl -fL \
-  https://raw.githubusercontent.com/vllm-project/vllm/main/examples/pooling/score/template/qwen3_vl_reranker.jinja \
-  -o ~/models/Qwen/vllm-templates/qwen3_vl_reranker.jinja
-```
-
-再启动 Reranker 服务：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 vllm serve \
-  /home/wangyi/models/Qwen/Qwen3-VL-Reranker-2B \
+vllm serve /models/Qwen3-VL-Reranker-2B \
   --runner pooling \
-  --host 127.0.0.1 \
+  --host 0.0.0.0 \
   --port 8300 \
   --served-model-name qwen3-vl-reranker-2b \
-  --api-key local-reranker-key \
+  --api-key <reranker-api-key> \
   --max-model-len 4096 \
-  --max-num-seqs 2 \
-  --gpu-memory-utilization 0.22 \
   --limit-mm-per-prompt '{"image":1}' \
   --hf-overrides '{"architectures":["Qwen3VLForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \
-  --chat-template ~/models/Qwen/vllm-templates/qwen3_vl_reranker.jinja
+  --chat-template /models/templates/qwen3_vl_reranker.jinja
 ```
 
-项目 `.env` 配置：
+应用配置：
 
 ```env
 EMBEDDING_PROVIDER=vllm
-EMBEDDING_VLLM_BASE_URL=http://127.0.0.1:8200/v1
-EMBEDDING_VLLM_API_KEY=local-embedding-key
+EMBEDDING_VLLM_BASE_URL=http://<embedding-host>:8200/v1
+EMBEDDING_VLLM_API_KEY=<embedding-api-key>
 EMBEDDING_VLLM_MODEL=qwen3-vl-embedding-2b
-EMBEDDING_VLLM_BATCH_SIZE=8
-EMBEDDING_VLLM_TIMEOUT_SECONDS=120
 
 RERANKER_PROVIDER=vllm
-RERANKER_VLLM_BASE_URL=http://127.0.0.1:8300/v1
-RERANKER_VLLM_API_KEY=local-reranker-key
+RERANKER_VLLM_BASE_URL=http://<reranker-host>:8300/v1
+RERANKER_VLLM_API_KEY=<reranker-api-key>
 RERANKER_VLLM_MODEL=qwen3-vl-reranker-2b
-RERANKER_VLLM_TIMEOUT_SECONDS=120
 ```
 
-上述显存比例是 RTX 5090 同时运行生成式 VLM、Embedding 和 Reranker 时的起始参考值，不是固定要求。三个 vLLM 实例的显存预算总和应留出 CUDA、Docling 和其他进程所需余量。
+### OpenAI-compatible VLM
 
-## OCR 和 VLM
-
-OCR 与图片描述 VLM 是彼此独立的增强能力。未配置时可以保持禁用：
-
-```env
-OCR_PROVIDER=disabled
-PADDLEOCR_ACCESS_TOKEN=
-
-VLM_PROVIDER=disabled
-```
-
-启用 PaddleOCR 云 API 或阿里云百炼 VLM 时：
-
-1. 填写 `PADDLEOCR_ACCESS_TOKEN`，并将 `OCR_PROVIDER` 改为 `paddleocr`。
-2. 填写 `DASHSCOPE_API_KEY`，并将 `VLM_PROVIDER` 改为 `dashscope`。
-3. 重启 FastAPI；若使用 Celery，也要重启 Worker。
-
-项目也支持通过 OpenAI-compatible Chat Completions API 调用本地 VLM。
-`VLM_PROVIDER=vllm` 与 `VLM_PROVIDER=openai_compatible` 使用同一套配置，前者用于明确标识部署方式。
-
-### 在服务器上部署 Qwen3-VL vLLM 服务
-
-建议让 vLLM 使用独立 Python 环境和独立进程，不要安装到本项目虚拟环境中。在服务器终端执行：
+生成式 VLM 通过 Chat Completions 接口调用：
 
 ```bash
-python3 -m venv ~/venvs/qwen-vllm
-source ~/venvs/qwen-vllm/bin/activate
-python -m pip install --upgrade pip
-pip install accelerate
-pip install "qwen-vl-utils==0.0.14"
-pip install --upgrade "vllm>=0.14.0"
-
-CUDA_VISIBLE_DEVICES=0 vllm serve \
-  /home/wangyi/models/Qwen/Qwen3-VL-8B-Instruct-FP8 \
-  --host 127.0.0.1 \
+vllm serve /models/Qwen3-VL-8B-Instruct-FP8 \
+  --host 0.0.0.0 \
   --port 8100 \
   --served-model-name qwen3-vl-8b-instruct-fp8 \
-  --api-key local-vlm-key \
+  --api-key <vlm-api-key> \
   --max-model-len 8192 \
-  --max-num-seqs 2 \
-  --gpu-memory-utilization 0.42 \
   --limit-mm-per-prompt '{"image":1}'
 ```
 
-RTX 5090 同时运行 VLM、Embedding 和 Reranker 时，先从 README 中三个服务合计约 `0.86` 的 vLLM 显存预算和单个 Celery Worker 开始；确认显存余量后再逐步提高并发。若这三个模型分配到不同 GPU，可以分别提高各服务的显存预算。
-
-另开一个服务器终端验证 vLLM：
-
-```bash
-curl -sS http://127.0.0.1:8100/v1/models \
-  -H "Authorization: Bearer local-vlm-key"
-```
-
-然后在项目服务器的 `.env` 中配置：
-
 ```env
 VLM_PROVIDER=vllm
-VLM_BASE_URL=http://127.0.0.1:8100/v1
-VLM_API_KEY=local-vlm-key
+VLM_BASE_URL=http://<vlm-host>:8100/v1
+VLM_API_KEY=<vlm-api-key>
 VLM_MODEL=qwen3-vl-8b-instruct-fp8
 VLM_MAX_TOKENS=800
 VLM_TIMEOUT_SECONDS=120
 ```
 
-`VLM_MODEL` 必须与 `--served-model-name` 一致。若 vLLM 未使用 `--api-key`，`VLM_API_KEY` 可留空；若 FastAPI 或 Celery 在 Docker 容器内运行，则 `127.0.0.1` 要改为容器能够访问的 vLLM 地址。
+修改解析器、OCR、VLM 或 Embedding 配置后，需要重启 FastAPI 和 Celery Worker。已经入库的文档不会自动重新处理，可使用 `force=true` 创建新版本。
 
-VLM 在文档入库阶段处理解析出的图片，描述结果会写入派生对象并参与 Embedding。修改 VLM 配置后必须同时重启 FastAPI 和 Celery Worker；已经入库的文档不会自动补充描述，需要使用 `force=true` 创建新版本并重新入库。
+## 启动服务
 
-## 启动 API
+启动 API：
 
-确认 PostgreSQL、Qdrant 和 MinIO 已启动且数据库迁移完成，然后运行：
-
-```powershell
-cd C:\Development\multimodal-rag
-.\.venv\Scripts\Activate.ps1
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-常用地址：
+开发环境需要热重载时增加 `--reload`。
 
-- OpenAPI：`http://127.0.0.1:8000/docs`
-- 存活检查：`http://127.0.0.1:8000/health/live`
-- 就绪检查：`http://127.0.0.1:8000/health/ready`
+健康检查：
 
-开发身份可以通过请求头覆盖：
+- `GET /health/live`
+- `GET /health/ready`
+- OpenAPI：`GET /docs`
+
+### Celery Worker
+
+异步模式下需要独立启动 Worker：
+
+```bash
+celery -A app.workers.celery_app:celery_app worker --loglevel=INFO
+```
+
+省略 `--concurrency` 时，Celery 会根据运行环境和 Worker Pool 自动确定并发数；Linux 默认 prefork 通常以可见 CPU 核心数为基础。也可以显式设置：
+
+```bash
+celery -A app.workers.celery_app:celery_app worker \
+  --loglevel=INFO \
+  --concurrency=<worker-process-count>
+```
+
+Celery 并发数不应只按 CPU 核数决定。每个进程都可能独立加载 Docling、布局模型、TableFormer、RapidOCR 或进程内 Qwen 模型。建议根据以下上限制定并发：
 
 ```text
-X-Tenant-ID: tenant UUID
-X-User-ID: user UUID
-X-Roles: engineering,reviewer
-X-Groups: group-a
+安全并发数 = min(
+  可用 CPU 并发能力,
+  可用内存 / 单任务峰值内存,
+  可用显存 / 单进程峰值显存
+)
 ```
 
-未传入时使用开发环境的默认 Tenant 和 User。
+对于单 GPU 或大模型进程内推理，应先通过压测确认模型是否会在每个 Worker 进程中重复加载；对于云端 Provider 和 CPU Docling，可在内存允许的情况下提高并发。容器部署还应确认 Celery 看到的 CPU 数量与容器实际 CPU 配额一致。
 
-## 上传、查看任务和搜索
+Windows 开发环境不支持 prefork 时可使用：
+
+```powershell
+python -m celery -A app.workers.celery_app:celery_app worker --loglevel=INFO --pool=solo
+```
+
+Worker 必须读取与 API 一致的 `.env`，并能够访问 PostgreSQL、Redis、Qdrant、MinIO 和已启用的外部 Provider。
+
+## API 示例
+
+请求通过以下 Header 传递身份和权限上下文：
+
+```text
+X-Tenant-ID: <tenant-uuid>
+X-User-ID: <user-uuid>
+X-Roles: <comma-separated-roles>
+X-Groups: <comma-separated-groups>
+```
 
 上传文档：
 
-```powershell
-curl.exe -X POST http://127.0.0.1:8000/v1/documents `
-  -F "file=@sample.pdf" `
-  -F "parser=docling"
+```bash
+curl -X POST http://<api-host>:8000/v1/documents \
+  -H "X-Tenant-ID: <tenant-uuid>" \
+  -H "X-User-ID: <user-uuid>" \
+  -H "X-Groups: <group-name>" \
+  -F "file=@sample.pdf;type=application/pdf" \
+  -F "parser=docling" \
+  -F "acl_subjects=group:<group-name>"
 ```
 
-接口返回 HTTP 202，以及 `document_id`、`version_id` 和 `job_id`。使用返回的 `job_id` 查看导入进度：
+接口返回 HTTP 202，以及 `document_id`、`version_id` 和 `job_id`。
 
-```powershell
-curl.exe http://127.0.0.1:8000/v1/jobs/<job_id>
+查询任务：
+
+```bash
+curl http://<api-host>:8000/v1/jobs/<job-id> \
+  -H "X-Tenant-ID: <tenant-uuid>" \
+  -H "X-User-ID: <user-uuid>"
 ```
 
-文档状态变为 `search_ready` 后执行搜索：
+执行混合检索：
 
-```powershell
-curl.exe -X POST http://127.0.0.1:8000/v1/search `
-  -H "Content-Type: application/json" `
-  -d '{"query":"查找系统架构图和相关说明","top_k":10}'
+```bash
+curl -X POST http://<api-host>:8000/v1/search \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: <tenant-uuid>" \
+  -H "X-User-ID: <user-uuid>" \
+  -H "X-Groups: <group-name>" \
+  -d '{
+    "query": "查找系统架构图和相关说明",
+    "top_k": 10,
+    "text_candidate_k": 30,
+    "image_candidate_k": 20,
+    "include": {
+      "snippets": true,
+      "image_metadata": true
+    }
+  }'
 ```
-
-## Celery 执行模式
-
-当前设置：
-
-```env
-CELERY_TASK_ALWAYS_EAGER=true
-```
-
-在此模式下，导入任务由 FastAPI 进程执行，适合本机单进程调试，不要求单独启动 Celery Worker。
-
-需要测试真正的异步队列时，将其改为：
-
-```env
-CELERY_TASK_ALWAYS_EAGER=false
-REDIS_URL=redis://:123456@127.0.0.1:6379/0
-VECTOR_PROVIDER=qdrant
-```
-
-然后重启 API，并在另一个 PowerShell 窗口启动 Worker。Windows 本机建议使用 `solo` 池：
-
-```powershell
-cd C:\Development\multimodal-rag
-.\.venv\Scripts\Activate.ps1
-celery -A app.workers.celery_app:celery_app worker --loglevel=INFO --pool=solo
-```
-
-Worker 必须读取与 API 相同的 `.env`，并能访问 PostgreSQL、Redis、Qdrant、MinIO 和本地模型目录。无 GPU 环境不要随意启动多个 Worker，因为每个进程可能各自加载模型并占用大量内存。
 
 ## 测试与代码检查
 
-```powershell
+```bash
 pytest
-ruff check .
+ruff check app tests
 ```
 
-自动化测试使用临时 SQLite、本地对象存储、内存向量库和 Mock Provider，不会加载真实 Qwen 模型，也不会访问 PostgreSQL、Redis、Qdrant、MinIO 或外部 API。
+自动化测试使用临时 SQLite、本地对象存储、内存向量库和 Mock Provider，不访问真实基础设施或外部 API。
 
-Mock 表示用于测试的轻量替代实现：Embedding 生成确定性的哈希向量，Reranker 使用简单词项匹配。它只能验证程序链路，不能代表真实语义检索效果。
+Mock Provider 是用于测试的确定性替代实现：Embedding 生成哈希向量，Reranker 使用词项匹配。它用于验证接口、权限、版本和编排逻辑，不代表真实语义检索质量。
