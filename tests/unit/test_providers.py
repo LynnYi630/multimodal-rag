@@ -10,6 +10,8 @@ from app.infrastructure.providers import (
     MockEmbeddingProvider,
     OpenAICompatibleVLMProvider,
     PaddleOCRProvider,
+    VLLMEmbeddingProvider,
+    VLLMRerankerProvider,
 )
 
 
@@ -165,3 +167,95 @@ async def test_openai_compatible_vlm_allows_vllm_without_api_key() -> None:
     await client.aclose()
 
     assert result.summary == "图片"
+
+
+@pytest.mark.asyncio
+async def test_vllm_embedding_uses_multimodal_chat_embeddings_api() -> None:
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "http://embedding.local/v1/embeddings"
+        assert request.headers["Authorization"] == "Bearer embedding-key"
+        body = json.loads(request.content)
+        requests.append(body)
+        assert body["continue_final_message"] is True
+        assert body["add_special_tokens"] is True
+        assert body["messages"][0][0]["role"] == "system"
+        assert body["messages"][0][0]["content"][0]["text"] == "query instruction"
+        image_url = body["messages"][1][1]["content"][0]["image_url"]["url"]
+        assert image_url.startswith("data:image/png;base64,")
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"index": 1, "embedding": [0.0, 2.0, 0.0]},
+                    {"index": 0, "embedding": [3.0, 0.0, 0.0]},
+                ]
+            },
+        )
+
+    settings = Settings(
+        _env_file=None,
+        embedding_provider="vllm",
+        embedding_dimension=3,
+        embedding_vllm_base_url="http://embedding.local/v1/",
+        embedding_vllm_api_key="embedding-key",
+        embedding_vllm_model="embedding-model",
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = VLLMEmbeddingProvider(settings, client)
+    result = await provider.embed_documents(
+        [
+            MultimodalInput(text="query", instruction="query instruction"),
+            MultimodalInput(text="document", image=b"\x89PNG\r\n"),
+        ]
+    )
+    await client.aclose()
+
+    assert len(requests) == 1
+    assert result == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+
+
+@pytest.mark.asyncio
+async def test_vllm_reranker_uses_multimodal_rerank_api() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "http://reranker.local/v1/rerank"
+        assert "Authorization" not in request.headers
+        body = json.loads(request.content)
+        assert body["model"] == "reranker-model"
+        assert body["query"] == "人民建议"
+        assert body["documents"][0] == "无关内容"
+        content = body["documents"][1]["content"]
+        assert content[0] == {"type": "text", "text": "建议征集表"}
+        assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+        assert body["top_n"] == 2
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"index": 1, "relevance_score": 0.91},
+                    {"index": 0, "relevance_score": 0.12},
+                ]
+            },
+        )
+
+    settings = Settings(
+        _env_file=None,
+        reranker_provider="vllm",
+        reranker_vllm_base_url="http://reranker.local/v1/",
+        reranker_vllm_api_key="",
+        reranker_vllm_model="reranker-model",
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = VLLMRerankerProvider(settings, client)
+    result = await provider.rerank(
+        MultimodalInput(text="人民建议"),
+        [
+            MultimodalInput(text="无关内容"),
+            MultimodalInput(text="建议征集表", image=b"\x89PNG\r\n"),
+        ],
+        top_n=2,
+    )
+    await client.aclose()
+
+    assert [(item.index, item.score) for item in result] == [(1, 0.91), (0, 0.12)]

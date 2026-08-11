@@ -340,6 +340,137 @@ class MockRerankerProvider:
         return sorted(scores, key=lambda item: (-item.score, item.index))[:top_n]
 
 
+class VLLMEmbeddingProvider:
+    """Qwen3-VL embedding served by vLLM's multimodal Embeddings API."""
+
+    def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
+        self.model_name = settings.embedding_model
+        self.revision = settings.embedding_revision
+        self.dimension = settings.embedding_dimension
+        self.base_url = settings.embedding_vllm_base_url.rstrip("/")
+        self.api_key = settings.embedding_vllm_api_key
+        self.served_model = settings.embedding_vllm_model
+        self.batch_size = settings.embedding_vllm_batch_size
+        self.client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.embedding_vllm_timeout_seconds, connect=15)
+        )
+        self._owns_client = client is None
+
+    async def close(self) -> None:
+        if self._owns_client:
+            await self.client.aclose()
+
+    async def embed_query(self, query: MultimodalInput) -> list[float]:
+        return (await self.embed_documents([query]))[0]
+
+    async def embed_documents(
+        self,
+        documents: list[MultimodalInput],
+    ) -> list[list[float]]:
+        result: list[list[float]] = []
+        for offset in range(0, len(documents), self.batch_size):
+            batch = documents[offset : offset + self.batch_size]
+            result.extend(await self._embed_batch(batch))
+        return result
+
+    async def _embed_batch(
+        self,
+        documents: list[MultimodalInput],
+    ) -> list[list[float]]:
+        response = await self.client.post(
+            f"{self.base_url}/embeddings",
+            headers=_bearer_headers(self.api_key),
+            json={
+                "model": self.served_model,
+                "messages": [_vllm_embedding_messages(item) for item in documents],
+                "encoding_format": "float",
+                "continue_final_message": True,
+                "add_special_tokens": True,
+            },
+        )
+        if not response.is_success:
+            raise ExternalProviderError(
+                f"vLLM embedding HTTP {response.status_code}: {response.text[:500]}"
+            )
+        try:
+            data = response.json()["data"]
+            ordered = sorted(data, key=lambda item: int(item["index"]))
+            if len(ordered) != len(documents):
+                raise ValueError("embedding count mismatch")
+            if [int(item["index"]) for item in ordered] != list(range(len(documents))):
+                raise ValueError("embedding indexes are invalid")
+            vectors = [list(map(float, item["embedding"])) for item in ordered]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ExternalProviderError("vLLM embedding returned invalid JSON") from exc
+        if any(len(vector) != self.dimension for vector in vectors):
+            raise ExternalProviderError(
+                f"vLLM embedding output must be {self.dimension} dimensions"
+            )
+        return [normalize(vector) for vector in vectors]
+
+
+class VLLMRerankerProvider:
+    """Qwen3-VL reranker served by vLLM's Jina/Cohere-compatible API."""
+
+    def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None) -> None:
+        self.model_name = settings.reranker_model
+        self.revision = settings.reranker_revision
+        self.base_url = settings.reranker_vllm_base_url.rstrip("/")
+        self.api_key = settings.reranker_vllm_api_key
+        self.served_model = settings.reranker_vllm_model
+        self.client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.reranker_vllm_timeout_seconds, connect=15)
+        )
+        self._owns_client = client is None
+
+    async def close(self) -> None:
+        if self._owns_client:
+            await self.client.aclose()
+
+    async def rerank(
+        self,
+        query: MultimodalInput,
+        candidates: list[MultimodalInput],
+        *,
+        top_n: int,
+    ) -> list[RerankScore]:
+        if not candidates or top_n <= 0:
+            return []
+        requested_top_n = min(top_n, len(candidates))
+        response = await self.client.post(
+            f"{self.base_url}/rerank",
+            headers=_bearer_headers(self.api_key),
+            json={
+                "model": self.served_model,
+                "query": _vllm_score_input(query),
+                "documents": [_vllm_score_input(item) for item in candidates],
+                "top_n": requested_top_n,
+            },
+        )
+        if not response.is_success:
+            raise ExternalProviderError(
+                f"vLLM reranker HTTP {response.status_code}: {response.text[:500]}"
+            )
+        try:
+            values = response.json()["results"]
+            scores = [
+                RerankScore(
+                    index=int(item["index"]),
+                    score=float(item["relevance_score"]),
+                )
+                for item in values
+            ]
+            if len(scores) != requested_top_n:
+                raise ValueError("reranker result count mismatch")
+            if len({item.index for item in scores}) != len(scores):
+                raise ValueError("reranker returned duplicate indexes")
+            if any(item.index < 0 or item.index >= len(candidates) for item in scores):
+                raise ValueError("reranker index out of range")
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ExternalProviderError("vLLM reranker returned invalid JSON") from exc
+        return sorted(scores, key=lambda item: (-item.score, item.index))
+
+
 class QwenLocalEmbeddingProvider:
     model_name: str
     revision: str
@@ -468,6 +599,58 @@ def _qwen_input(
     if include_instruction and value.instruction:
         result["instruction"] = value.instruction
     return result
+
+
+def _bearer_headers(api_key: str) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+def _vllm_embedding_messages(value: MultimodalInput) -> list[dict[str, Any]]:
+    content = _vllm_content(value)
+    return [
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": value.instruction or "Represent the user's input.",
+                }
+            ],
+        },
+        {"role": "user", "content": content},
+        {"role": "assistant", "content": [{"type": "text", "text": ""}]},
+    ]
+
+
+def _vllm_score_input(value: MultimodalInput) -> str | dict[str, Any]:
+    text = "\n".join(filter(None, [value.instruction, value.text]))
+    if not value.image:
+        return text
+    content: list[dict[str, Any]] = []
+    if text:
+        content.append({"type": "text", "text": text})
+    content.append(_vllm_image_part(value.image))
+    return {"content": content}
+
+
+def _vllm_content(value: MultimodalInput) -> list[dict[str, Any]]:
+    content: list[dict[str, Any]] = []
+    if value.image:
+        content.append(_vllm_image_part(value.image))
+    content.append({"type": "text", "text": value.text or ""})
+    return content
+
+
+def _vllm_image_part(image: bytes) -> dict[str, Any]:
+    media_type = _detect_image_media_type(image)
+    encoded = base64.b64encode(image).decode("ascii")
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{media_type};base64,{encoded}"},
+    }
 
 
 def _semantic_tokens(text: str) -> list[str]:

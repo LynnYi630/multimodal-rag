@@ -49,19 +49,28 @@ class Settings(BaseSettings):
     mineru_enabled: bool = False
     mineru_base_url: str = ""
 
-    embedding_provider: Literal["mock", "qwen_local"] = "mock"
+    embedding_provider: Literal["mock", "qwen_local", "vllm"] = "mock"
     embedding_model: str = "Qwen/Qwen3-VL-Embedding-2B"
     embedding_revision: str = "locked-revision"
     embedding_dimension: int = 2048
+    embedding_vllm_base_url: str = "http://127.0.0.1:8200/v1"
+    embedding_vllm_api_key: str = ""
+    embedding_vllm_model: str = "qwen3-vl-embedding-2b"
+    embedding_vllm_batch_size: int = 8
+    embedding_vllm_timeout_seconds: float = 120
     qwen_embedding_module: str = "src.models.qwen3_vl_embedding"
     qwen_embedding_class: str = "Qwen3VLEmbedder"
     qwen_embedding_model_path: str = "./models/Qwen3-VL-Embedding-2B"
     qwen_embedding_repository_path: str = ""
     qwen_repository_path: str = ""
 
-    reranker_provider: Literal["mock", "qwen_local"] = "mock"
+    reranker_provider: Literal["mock", "qwen_local", "vllm"] = "mock"
     reranker_model: str = "Qwen/Qwen3-VL-Reranker-2B"
     reranker_revision: str = "locked-revision"
+    reranker_vllm_base_url: str = "http://127.0.0.1:8300/v1"
+    reranker_vllm_api_key: str = ""
+    reranker_vllm_model: str = "qwen3-vl-reranker-2b"
+    reranker_vllm_timeout_seconds: float = 120
     qwen_reranker_module: str = "src.models.qwen3_vl_reranker"
     qwen_reranker_class: str = "Qwen3VLReranker"
     qwen_reranker_model_path: str = "./models/Qwen3-VL-Reranker-2B"
@@ -117,6 +126,26 @@ class Settings(BaseSettings):
                 )
             if self.vlm_max_tokens <= 0:
                 raise ValueError("VLM_MAX_TOKENS must be greater than zero")
+        if self.embedding_provider == "vllm":
+            if not self.embedding_vllm_base_url.strip():
+                raise ValueError(
+                    "EMBEDDING_VLLM_BASE_URL is required when EMBEDDING_PROVIDER=vllm"
+                )
+            if not self.embedding_vllm_model.strip():
+                raise ValueError(
+                    "EMBEDDING_VLLM_MODEL is required when EMBEDDING_PROVIDER=vllm"
+                )
+            if self.embedding_vllm_batch_size <= 0:
+                raise ValueError("EMBEDDING_VLLM_BATCH_SIZE must be greater than zero")
+        if self.reranker_provider == "vllm":
+            if not self.reranker_vllm_base_url.strip():
+                raise ValueError(
+                    "RERANKER_VLLM_BASE_URL is required when RERANKER_PROVIDER=vllm"
+                )
+            if not self.reranker_vllm_model.strip():
+                raise ValueError(
+                    "RERANKER_VLLM_MODEL is required when RERANKER_PROVIDER=vllm"
+                )
         if self.storage_provider == "minio" and (
             not self.minio_access_key or not self.minio_secret_key
         ):

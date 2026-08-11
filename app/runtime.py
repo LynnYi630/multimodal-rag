@@ -22,6 +22,8 @@ from app.infrastructure.providers import (
     PaddleOCRProvider,
     QwenLocalEmbeddingProvider,
     QwenLocalRerankerProvider,
+    VLLMEmbeddingProvider,
+    VLLMRerankerProvider,
 )
 from app.infrastructure.storage import FileSystemStorage, MinioStorage
 from app.infrastructure.vector import InMemoryVectorRepository, QdrantVectorRepository
@@ -49,7 +51,13 @@ class Container:
         await self.vector.initialize()
 
     async def close(self) -> None:
-        for provider in (self.ocr, self.vlm, self.vector):
+        for provider in (
+            self.ocr,
+            self.vlm,
+            self.embedding,
+            self.reranker,
+            self.vector,
+        ):
             close = getattr(provider, "close", None)
             if close is not None:
                 result = close()
@@ -86,16 +94,18 @@ def build_container(settings: Settings) -> Container:
         vlm = OpenAICompatibleVLMProvider(settings)
     else:
         vlm = DisabledVLMProvider()
-    embedding = (
-        QwenLocalEmbeddingProvider(settings)
-        if settings.embedding_provider == "qwen_local"
-        else MockEmbeddingProvider(settings.embedding_dimension)
-    )
-    reranker = (
-        QwenLocalRerankerProvider(settings)
-        if settings.reranker_provider == "qwen_local"
-        else MockRerankerProvider()
-    )
+    if settings.embedding_provider == "qwen_local":
+        embedding = QwenLocalEmbeddingProvider(settings)
+    elif settings.embedding_provider == "vllm":
+        embedding = VLLMEmbeddingProvider(settings)
+    else:
+        embedding = MockEmbeddingProvider(settings.embedding_dimension)
+    if settings.reranker_provider == "qwen_local":
+        reranker = QwenLocalRerankerProvider(settings)
+    elif settings.reranker_provider == "vllm":
+        reranker = VLLMRerankerProvider(settings)
+    else:
+        reranker = MockRerankerProvider()
     documents = DocumentService(
         settings=settings,
         database=database,

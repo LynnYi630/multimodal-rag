@@ -164,6 +164,72 @@ QWEN_RERANKER_REPOSITORY_PATH=C:/Models/Qwen/Qwen3-VL-Reranker-2B/scripts
 
 本地 Embedding 和 Reranker 不需要 API Key。模型采用延迟加载并在首次调用后常驻进程；生产环境应使用 GPU，并根据显存规划 API/Worker 的进程数，避免每个进程重复加载一份模型。
 
+### 使用 vLLM 部署 Embedding 和 Reranker
+
+Qwen3-VL-Embedding/Reranker 的 vLLM 支持要求 `vllm>=0.14.0`。两个模型必须分别启动为独立 pooling 服务；不能与生成式 VLM 共用同一个 vLLM 进程。
+
+Embedding 服务：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve \
+  /home/wangyi/models/Qwen/Qwen3-VL-Embedding-2B \
+  --runner pooling \
+  --host 127.0.0.1 \
+  --port 8200 \
+  --served-model-name qwen3-vl-embedding-2b \
+  --api-key local-embedding-key \
+  --max-model-len 8192 \
+  --max-num-seqs 8 \
+  --gpu-memory-utilization 0.22 \
+  --limit-mm-per-prompt '{"image":1}'
+```
+
+Reranker 必须使用 vLLM 官方 Qwen3-VL 模板。先下载模板：
+
+```bash
+mkdir -p ~/models/Qwen/vllm-templates
+curl -fL \
+  https://raw.githubusercontent.com/vllm-project/vllm/main/examples/pooling/score/template/qwen3_vl_reranker.jinja \
+  -o ~/models/Qwen/vllm-templates/qwen3_vl_reranker.jinja
+```
+
+再启动 Reranker 服务：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve \
+  /home/wangyi/models/Qwen/Qwen3-VL-Reranker-2B \
+  --runner pooling \
+  --host 127.0.0.1 \
+  --port 8300 \
+  --served-model-name qwen3-vl-reranker-2b \
+  --api-key local-reranker-key \
+  --max-model-len 4096 \
+  --max-num-seqs 2 \
+  --gpu-memory-utilization 0.22 \
+  --limit-mm-per-prompt '{"image":1}' \
+  --hf-overrides '{"architectures":["Qwen3VLForSequenceClassification"],"classifier_from_token":["no","yes"],"is_original_qwen3_reranker":true}' \
+  --chat-template ~/models/Qwen/vllm-templates/qwen3_vl_reranker.jinja
+```
+
+项目 `.env` 配置：
+
+```env
+EMBEDDING_PROVIDER=vllm
+EMBEDDING_VLLM_BASE_URL=http://127.0.0.1:8200/v1
+EMBEDDING_VLLM_API_KEY=local-embedding-key
+EMBEDDING_VLLM_MODEL=qwen3-vl-embedding-2b
+EMBEDDING_VLLM_BATCH_SIZE=8
+EMBEDDING_VLLM_TIMEOUT_SECONDS=120
+
+RERANKER_PROVIDER=vllm
+RERANKER_VLLM_BASE_URL=http://127.0.0.1:8300/v1
+RERANKER_VLLM_API_KEY=local-reranker-key
+RERANKER_VLLM_MODEL=qwen3-vl-reranker-2b
+RERANKER_VLLM_TIMEOUT_SECONDS=120
+```
+
+上述显存比例是 RTX 5090 同时运行生成式 VLM、Embedding 和 Reranker 时的起始参考值，不是固定要求。三个 vLLM 实例的显存预算总和应留出 CUDA、Docling 和其他进程所需余量。
+
 ## OCR 和 VLM
 
 OCR 与图片描述 VLM 是彼此独立的增强能力。未配置时可以保持禁用：
@@ -194,7 +260,7 @@ source ~/venvs/qwen-vllm/bin/activate
 python -m pip install --upgrade pip
 pip install accelerate
 pip install "qwen-vl-utils==0.0.14"
-pip install --upgrade "vllm>=0.11.0"
+pip install --upgrade "vllm>=0.14.0"
 
 CUDA_VISIBLE_DEVICES=0 vllm serve \
   /home/wangyi/models/Qwen/Qwen3-VL-8B-Instruct-FP8 \
@@ -204,11 +270,11 @@ CUDA_VISIBLE_DEVICES=0 vllm serve \
   --api-key local-vlm-key \
   --max-model-len 8192 \
   --max-num-seqs 2 \
-  --gpu-memory-utilization 0.50 \
+  --gpu-memory-utilization 0.42 \
   --limit-mm-per-prompt '{"image":1}'
 ```
 
-RTX 5090 同时运行 VLM、Embedding 和 Reranker 时，先从 `0.50` 的 vLLM 显存比例和单个 Celery Worker 开始；确认显存余量后再逐步提高并发。若这三个模型分配到不同 GPU，可以分别提高各服务的显存预算。
+RTX 5090 同时运行 VLM、Embedding 和 Reranker 时，先从 README 中三个服务合计约 `0.86` 的 vLLM 显存预算和单个 Celery Worker 开始；确认显存余量后再逐步提高并发。若这三个模型分配到不同 GPU，可以分别提高各服务的显存预算。
 
 另开一个服务器终端验证 vLLM：
 
